@@ -1,0 +1,158 @@
+name: Add Issue to Project via GraphQL (Dynamic Field Fetch)
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  add_to_project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: generate-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.AUTOPROJECT_APP_ID }}
+          private-key: ${{ secrets.AUTOPROJECT_APP_PEM }}
+
+      - name: Check if issue author is a repository collaborator
+        id: check_user
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const username = context.payload.sender.login;
+            const repo = context.repo.repo;
+            const owner = context.repo.owner;
+            core.setOutput("issue_id", context.payload.issue.node_id);
+
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username,
+              });
+
+              const permission = data.permission;
+              core.setOutput("is_member", ['admin', 'write', 'maintain'].includes(permission) ? 'true' : 'false');
+            } catch (error) {
+              core.setOutput("is_member", 'false');
+            }
+
+      - name: Fetch project and field IDs
+        if: steps.check_user.outputs.is_member == 'true'
+        id: metadata
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          ORG="CBNU-MoaNote-CapstonDesign"
+          PROJECT_NUMBER=12
+
+          echo "Fetching project ID..."
+          gh api graphql -f query='
+            query($org: String!, $number: Int!) {
+                organization(login: $org){
+                    projectV2(number: $number) {
+                        id
+                        fields(first:20) {
+                            nodes {
+                                ... on ProjectV2SingleSelectField {
+                                    id
+                                    name
+                                    options {
+                                        id
+                                        name
+                                    }
+                                }
+                                ... on ProjectV2IterationField {
+                                    id
+                                    name
+                                    configuration {
+                                        iterations {
+                                            startDate
+                                            id
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+              } ' -f org=$ORG -F number=$PROJECT_NUMBER --jq '.data.organization.projectV2' | tee project_data.json
+
+          PROJECT_ID=$(jq -r '.id' project_data.json)
+          STATUS_FIELD_ID=$(jq -r '.fields.nodes[] | select(.name=="Status") | .id' project_data.json)
+          TODO_OPTION_ID=$(jq -r '.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="Sub-Tasks") | .id' project_data.json)
+          SPRINT_FIELD_ID=$(jq -r '.fields.nodes[] | select(.name=="Sprint-Iteration") | .id' project_data.json)
+          CURRENT_ITERATION_ID=$(jq -r '.fields.nodes[] | select(.name=="Sprint-Iteration") | .configuration.iterations[0].id' project_data.json)
+
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+          echo "status_field_id=$STATUS_FIELD_ID" >> $GITHUB_OUTPUT
+          echo "todo_option_id=$TODO_OPTION_ID" >> $GITHUB_OUTPUT
+          echo "sprint_field_id=$SPRINT_FIELD_ID" >> $GITHUB_OUTPUT
+          echo "iteration_id=$CURRENT_ITERATION_ID" >> $GITHUB_OUTPUT
+
+      - name: Add issue to project
+        if: steps.check_user.outputs.is_member == 'true'
+        id: add_item
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          gh api graphql -f query='
+            mutation($project: ID!, $content: ID!) {
+              addProjectV2ItemById(input: {projectId: $project, contentId: $content}) {
+                item {
+                  id
+                }
+              }
+            }' \
+            -f project=${{ steps.metadata.outputs.project_id }} \
+            -f content=${{ steps.check_user.outputs.issue_id }} \
+            > result.json
+
+          ITEM_ID=$(jq -r '.data.addProjectV2ItemById.item.id' result.json)
+          echo "item_id=$ITEM_ID" >> $GITHUB_OUTPUT
+
+      - name: Set fields (Status and Sprint-Iteration)
+        if: steps.check_user.outputs.is_member == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          ITEM_ID=${{ steps.add_item.outputs.item_id }}
+
+          # Set Status to Todo
+          gh api graphql -f query='
+            mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project,
+                itemId: $item,
+                fieldId: $field,
+                value: { singleSelectOptionId: $option }
+              }) {
+                projectV2Item { id }
+              }
+            }' \
+            -f project=${{ steps.metadata.outputs.project_id }} \
+            -f item=$ITEM_ID \
+            -f field=${{ steps.metadata.outputs.status_field_id }} \
+            -f option=${{ steps.metadata.outputs.todo_option_id }}
+
+          # Set Sprint-Iteration to current
+          gh api graphql -f query='
+            mutation($project: ID!, $item: ID!, $field: ID!, $iteration: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project,
+                itemId: $item,
+                fieldId: $field,
+                value: { iterationId: $iteration }
+              }) {
+                projectV2Item { id }
+              }
+            }' \
+            -f project=${{ steps.metadata.outputs.project_id }} \
+            -f item=$ITEM_ID \
+            -f field=${{ steps.metadata.outputs.sprint_field_id }} \
+            -f iteration=${{ steps.metadata.outputs.iteration_id }}
