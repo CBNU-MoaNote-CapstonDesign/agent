@@ -96,6 +96,7 @@ async def updateBotMessage(channel_id:str,message:UserChatMessageBroadcastDTO,co
 
 class RequestPayload(BaseModel):
     channelId: str
+    content: str
 
 @app.post("/request")
 async def handle_request(payload: RequestPayload):
